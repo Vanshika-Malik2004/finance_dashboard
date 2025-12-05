@@ -1,15 +1,166 @@
 "use client";
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useMemo } from "react";
 import { createPortal } from "react-dom";
-import JsonExplorer from "./JsonExplorer";
 import useDashboardStore from "@/store/dashboardStore";
-import { inferFormat } from "@/lib/jsonPath";
+
+/**
+ * Detect if an object is a time-series format (dates as keys with OHLCV data)
+ */
+function isTimeSeriesObject(obj) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
+
+  const keys = Object.keys(obj);
+  if (keys.length === 0) return false;
+
+  const firstKey = keys[0];
+  const firstValue = obj[firstKey];
+
+  const looksLikeDate =
+    /^\d{4}-\d{2}-\d{2}/.test(firstKey) ||
+    /^\d{4}\/\d{2}\/\d{2}/.test(firstKey) ||
+    !isNaN(Date.parse(firstKey));
+
+  const hasOHLCVFields =
+    firstValue &&
+    typeof firstValue === "object" &&
+    !Array.isArray(firstValue) &&
+    (("1. open" in firstValue && "4. close" in firstValue) ||
+      ("open" in firstValue && "close" in firstValue));
+
+  return looksLikeDate && hasOHLCVFields;
+}
+
+/**
+ * Extract chart-specific fields from time-series data
+ */
+function extractTimeSeriesFields(obj) {
+  const keys = Object.keys(obj);
+  if (keys.length === 0) return [];
+
+  const firstValue = obj[keys[0]];
+  if (!firstValue || typeof firstValue !== "object") return [];
+
+  const innerKeys = Object.keys(firstValue);
+  const fields = [];
+
+  const alphaVantageMap = {
+    "1. open": "open",
+    "2. high": "high",
+    "3. low": "low",
+    "4. close": "close",
+    "5. volume": "volume",
+    "5. adjusted close": "adjusted_close",
+    "6. volume": "volume",
+  };
+
+  for (const key of innerKeys) {
+    const cleanName = alphaVantageMap[key] || key;
+    const sampleValue = firstValue[key];
+
+    fields.push({
+      path: cleanName,
+      originalKey: key,
+      type: typeof sampleValue === "number" ? "number" : "string",
+      value: String(sampleValue).slice(0, 20),
+      isChartField: true,
+    });
+  }
+
+  return fields;
+}
+
+/**
+ * Recursively extracts all field paths from a JSON object
+ */
+function extractFieldPaths(obj, parentPath = "", results = []) {
+  if (obj === null || obj === undefined) return results;
+
+  if (Array.isArray(obj)) {
+    if (obj.length > 0 && typeof obj[0] === "object") {
+      extractFieldPaths(obj[0], parentPath, results);
+    }
+    if (parentPath) {
+      results.push({
+        path: parentPath,
+        type: "array",
+        value: `Array[${obj.length}]`,
+        isArray: true,
+      });
+    }
+  } else if (typeof obj === "object") {
+    for (const key of Object.keys(obj)) {
+      const currentPath = parentPath ? `${parentPath}.${key}` : key;
+      const value = obj[key];
+
+      if (value === null) {
+        results.push({ path: currentPath, type: "null", value: "null" });
+      } else if (Array.isArray(value)) {
+        results.push({
+          path: currentPath,
+          type: "array",
+          value: `Array[${value.length}]`,
+          isArray: true,
+        });
+        if (value.length > 0) {
+          extractFieldPaths(value[0], currentPath, results);
+        }
+      } else if (typeof value === "object") {
+        const isTimeSeries = isTimeSeriesObject(value);
+        results.push({
+          path: currentPath,
+          type: "object",
+          value: isTimeSeries
+            ? `TimeSeries[${Object.keys(value).length}]`
+            : "{...}",
+          isObject: true,
+          isTimeSeries: isTimeSeries,
+        });
+        if (!isTimeSeries) {
+          extractFieldPaths(value, currentPath, results);
+        }
+      } else {
+        results.push({
+          path: currentPath,
+          type: typeof value,
+          value: String(value).slice(0, 50),
+        });
+      }
+    }
+  }
+
+  return results;
+}
+
+/**
+ * Infer the format type based on the field path and value
+ */
+function inferFormat(path, value) {
+  const lowerPath = path.toLowerCase();
+  if (
+    lowerPath.includes("price") ||
+    lowerPath.includes("usd") ||
+    lowerPath.includes("cost") ||
+    lowerPath.includes("amount")
+  ) {
+    return "currency";
+  }
+  if (
+    lowerPath.includes("percent") ||
+    lowerPath.includes("change") ||
+    lowerPath.includes("ratio")
+  ) {
+    return "percent";
+  }
+  if (typeof value === "number" || !isNaN(parseFloat(value))) {
+    return "number";
+  }
+  return "string";
+}
 
 /**
  * WidgetConfigModal Component
  * Modal for configuring widget data source and field mappings
- * Uses React Portal to render at document body level to avoid z-index issues
  */
 export default function WidgetConfigModal({ isOpen, onClose, widget }) {
   const { updateWidget } = useDashboardStore();
@@ -28,8 +179,11 @@ export default function WidgetConfigModal({ isOpen, onClose, widget }) {
   const [isTestingApi, setIsTestingApi] = useState(false);
   const [apiResponse, setApiResponse] = useState(null);
   const [apiError, setApiError] = useState(null);
+  const [apiSuccess, setApiSuccess] = useState(false);
 
-  // Handle client-side mounting for portal
+  // Field selection state
+  const [fieldSearch, setFieldSearch] = useState("");
+
   useEffect(() => {
     setMounted(true);
     return () => setMounted(false);
@@ -45,8 +199,58 @@ export default function WidgetConfigModal({ isOpen, onClose, widget }) {
       setRefreshIntervalSec(widget.refreshIntervalSec || 60);
       setApiResponse(null);
       setApiError(null);
+      setApiSuccess(false);
+      setFieldSearch("");
     }
   }, [widget, isOpen]);
+
+  // Extract available fields from API response
+  const availableFields = useMemo(() => {
+    if (!apiResponse) return [];
+    return extractFieldPaths(apiResponse);
+  }, [apiResponse]);
+
+  // For charts: detect time-series data at the selected dataPath
+  const chartFields = useMemo(() => {
+    if (widget?.type !== "chart" || !apiResponse || !dataPath) return [];
+
+    const pathParts = dataPath.split(".");
+    let data = apiResponse;
+    for (const part of pathParts) {
+      if (data && typeof data === "object") {
+        data = data[part];
+      } else {
+        return [];
+      }
+    }
+
+    if (isTimeSeriesObject(data)) {
+      return extractTimeSeriesFields(data);
+    }
+
+    return [];
+  }, [widget?.type, dataPath, apiResponse]);
+
+  const isTimeSeriesSelected = chartFields.length > 0;
+
+  // Filter available fields
+  const filteredFields = useMemo(() => {
+    let fieldList = availableFields;
+
+    const selectedPaths = fields.map((f) => f.key);
+    fieldList = fieldList.filter((f) => !selectedPaths.includes(f.path));
+
+    if (fieldSearch.trim()) {
+      const search = fieldSearch.toLowerCase();
+      fieldList = fieldList.filter((f) =>
+        f.path.toLowerCase().includes(search)
+      );
+    }
+
+    fieldList = fieldList.filter((f) => !f.isObject || f.isTimeSeries);
+
+    return fieldList;
+  }, [availableFields, fields, fieldSearch]);
 
   // Test API endpoint
   const handleTestApi = async () => {
@@ -55,6 +259,7 @@ export default function WidgetConfigModal({ isOpen, onClose, widget }) {
     setIsTestingApi(true);
     setApiError(null);
     setApiResponse(null);
+    setApiSuccess(false);
 
     try {
       const response = await fetch(apiUrl);
@@ -63,38 +268,40 @@ export default function WidgetConfigModal({ isOpen, onClose, widget }) {
       }
       const json = await response.json();
       setApiResponse(json);
+      setApiSuccess(true);
     } catch (error) {
       setApiError(error.message);
+      setApiSuccess(false);
     } finally {
       setIsTestingApi(false);
     }
   };
 
-  // Handle path selection from JSON explorer
-  const handleSelectPath = useCallback((path) => {
-    setDataPath(path);
-  }, []);
+  // Add a field from available fields
+  const handleAddField = (field) => {
+    const pathParts = field.path.split(".");
+    const label = pathParts[pathParts.length - 1]
+      .replace(/_/g, " ")
+      .replace(/\b\w/g, (l) => l.toUpperCase());
 
-  // Handle field selection from JSON explorer
-  const handleSelectFields = useCallback((selectedFields) => {
-    setFields(selectedFields);
-  }, []);
-
-  // Add a field manually
-  const addField = () => {
-    setFields([...fields, { key: "", label: "", format: "string" }]);
-  };
-
-  // Update a field
-  const updateField = (index, updates) => {
-    const newFields = [...fields];
-    newFields[index] = { ...newFields[index], ...updates };
-    setFields(newFields);
+    setFields((prev) => [
+      ...prev,
+      {
+        key: field.path,
+        label: label,
+        format: inferFormat(field.path, field.value),
+      },
+    ]);
   };
 
   // Remove a field
-  const removeField = (index) => {
-    setFields(fields.filter((_, i) => i !== index));
+  const removeField = (key) => {
+    setFields(fields.filter((f) => f.key !== key));
+  };
+
+  // Update a field
+  const updateField = (key, updates) => {
+    setFields(fields.map((f) => (f.key === key ? { ...f, ...updates } : f)));
   };
 
   // Save configuration
@@ -109,10 +316,8 @@ export default function WidgetConfigModal({ isOpen, onClose, widget }) {
     onClose();
   };
 
-  // Don't render until mounted (for SSR compatibility) or if not open
   if (!mounted || !isOpen || !widget) return null;
 
-  // Use portal to render modal at document body level
   return createPortal(
     <div className="fixed inset-0 z-[9999] flex items-center justify-center">
       {/* Backdrop */}
@@ -122,7 +327,7 @@ export default function WidgetConfigModal({ isOpen, onClose, widget }) {
       />
 
       {/* Modal Panel */}
-      <div className="relative w-full max-w-4xl max-h-[90vh] mx-4 bg-zinc-900 border border-zinc-800 rounded-2xl shadow-2xl overflow-hidden flex flex-col">
+      <div className="relative w-full max-w-3xl max-h-[90vh] mx-4 bg-zinc-900 border border-zinc-800 rounded-2xl shadow-2xl overflow-hidden flex flex-col">
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-zinc-800 flex-shrink-0">
           <div className="flex items-center gap-3">
@@ -146,7 +351,8 @@ export default function WidgetConfigModal({ isOpen, onClose, widget }) {
                 Configure Widget
               </h2>
               <p className="text-xs text-zinc-500">
-                Set up data source and field mappings
+                {widget.type.charAt(0).toUpperCase() + widget.type.slice(1)}{" "}
+                Widget
               </p>
             </div>
           </div>
@@ -169,7 +375,7 @@ export default function WidgetConfigModal({ isOpen, onClose, widget }) {
         </div>
 
         {/* Content */}
-        <div className="flex-1 overflow-y-auto p-6 space-y-6">
+        <div className="flex-1 overflow-y-auto p-6 space-y-5">
           {/* Basic Settings */}
           <div className="grid grid-cols-2 gap-4">
             <div>
@@ -206,7 +412,11 @@ export default function WidgetConfigModal({ isOpen, onClose, widget }) {
               <input
                 type="url"
                 value={apiUrl}
-                onChange={(e) => setApiUrl(e.target.value)}
+                onChange={(e) => {
+                  setApiUrl(e.target.value);
+                  setApiResponse(null);
+                  setApiSuccess(false);
+                }}
                 placeholder="https://api.example.com/data"
                 className="flex-1 px-4 py-2.5 rounded-xl bg-zinc-800 border border-zinc-700 text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500"
               />
@@ -245,137 +455,238 @@ export default function WidgetConfigModal({ isOpen, onClose, widget }) {
               </button>
             </div>
             {apiError && (
-              <p className="mt-2 text-sm text-red-400 flex items-center gap-1">
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  width="14"
-                  height="14"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                >
-                  <circle cx="12" cy="12" r="10" />
-                  <path d="M12 8v4M12 16h.01" />
-                </svg>
-                {apiError}
+              <p className="mt-2 text-sm text-red-400">{apiError}</p>
+            )}
+            {apiSuccess && (
+              <p className="mt-2 text-sm text-emerald-400">
+                ✓ API connection successful! Select fields below.
               </p>
             )}
           </div>
 
-          {/* JSON Explorer */}
-          {apiResponse && (
-            <div>
-              <div className="flex items-center justify-between mb-2">
-                <label className="text-sm font-medium text-zinc-300">
-                  API Response Explorer
-                </label>
-                {dataPath && (
-                  <span className="text-xs bg-emerald-500/20 text-emerald-400 px-2 py-1 rounded">
-                    Path: {dataPath}
-                  </span>
-                )}
-              </div>
-              <div className="bg-zinc-800/50 border border-zinc-700 rounded-xl p-4 max-h-[300px] overflow-auto">
-                <JsonExplorer
-                  data={apiResponse}
-                  onSelectPath={handleSelectPath}
-                  selectedPath={dataPath}
-                  onSelectFields={handleSelectFields}
-                />
-              </div>
-            </div>
-          )}
-
-          {/* Data Path (manual input) */}
+          {/* Data Path */}
           <div>
             <label className="block text-sm font-medium text-zinc-300 mb-1.5">
-              Data Path{" "}
-              <span className="text-zinc-500 font-normal">
-                (dot notation, e.g., "data.items")
-              </span>
+              Data Path (optional - for nested data)
             </label>
             <input
               type="text"
               value={dataPath}
               onChange={(e) => setDataPath(e.target.value)}
-              placeholder="Leave empty if data is at root level"
+              placeholder="e.g., data.items or Time Series (Daily)"
               className="w-full px-4 py-2.5 rounded-xl bg-zinc-800 border border-zinc-700 text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 font-mono text-sm"
             />
           </div>
 
-          {/* Field Mappings */}
-          <div>
-            <div className="flex items-center justify-between mb-2">
-              <label className="text-sm font-medium text-zinc-300">
-                Field Mappings
-              </label>
-              <button
-                onClick={addField}
-                className="text-xs px-2 py-1 rounded bg-zinc-800 text-zinc-400 hover:text-zinc-200 border border-zinc-700 hover:border-zinc-600 transition-colors"
-              >
-                + Add Field
-              </button>
-            </div>
-            <div className="space-y-2">
-              {fields.map((field, index) => (
-                <div
-                  key={index}
-                  className="flex items-center gap-2 p-3 bg-zinc-800/50 border border-zinc-700 rounded-xl"
+          {/* Chart Time-Series Fields */}
+          {widget?.type === "chart" && isTimeSeriesSelected && (
+            <div className="p-4 rounded-xl bg-blue-500/10 border border-blue-500/30">
+              <div className="flex items-center gap-2 mb-3">
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  width="18"
+                  height="18"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  className="text-blue-400"
                 >
-                  <input
-                    type="text"
-                    value={field.key}
-                    onChange={(e) =>
-                      updateField(index, { key: e.target.value })
-                    }
-                    placeholder="Key (e.g., price)"
-                    className="flex-1 px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-zinc-100 placeholder-zinc-500 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-blue-500"
-                  />
-                  <input
-                    type="text"
-                    value={field.label}
-                    onChange={(e) =>
-                      updateField(index, { label: e.target.value })
-                    }
-                    placeholder="Label"
-                    className="flex-1 px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-zinc-100 placeholder-zinc-500 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500"
-                  />
-                  <select
-                    value={field.format}
-                    onChange={(e) =>
-                      updateField(index, { format: e.target.value })
-                    }
-                    className="px-3 py-2 rounded-lg bg-zinc-800 border border-zinc-700 text-zinc-100 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500"
-                  >
-                    <option value="string">String</option>
-                    <option value="number">Number</option>
-                    <option value="currency">Currency</option>
-                    <option value="percent">Percent</option>
-                  </select>
-                  <button
-                    onClick={() => removeField(index)}
-                    className="p-2 rounded-lg text-zinc-500 hover:text-red-400 hover:bg-zinc-700 transition-colors"
-                  >
-                    <svg
-                      xmlns="http://www.w3.org/2000/svg"
-                      width="16"
-                      height="16"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2"
+                  <path d="M3 3v18h18" />
+                  <path d="m19 9-5 5-4-4-3 3" />
+                </svg>
+                <span className="text-sm font-medium text-blue-400">
+                  Time-Series Data Detected
+                </span>
+              </div>
+              <p className="text-xs text-zinc-400 mb-3">
+                Select which value to plot (Y-axis). Dates will be X-axis.
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {chartFields.map((field) => {
+                  const isSelected =
+                    fields.length > 1 && fields[1]?.key === field.path;
+                  return (
+                    <button
+                      key={field.path}
+                      type="button"
+                      onClick={() => {
+                        setFields([
+                          {
+                            key: "time",
+                            label: "Date",
+                            format: "string",
+                            isChartField: true,
+                          },
+                          {
+                            key: field.path,
+                            originalKey: field.originalKey,
+                            label:
+                              field.path.charAt(0).toUpperCase() +
+                              field.path.slice(1),
+                            format: "number",
+                            isChartField: true,
+                          },
+                        ]);
+                      }}
+                      className={`px-3 py-2 rounded-lg text-sm font-medium transition-all ${
+                        isSelected
+                          ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/50"
+                          : "bg-zinc-800 text-zinc-300 border border-zinc-700 hover:border-zinc-500"
+                      }`}
                     >
-                      <path d="M18 6L6 18M6 6l12 12" />
-                    </svg>
-                  </button>
+                      <span className="capitalize">{field.path}</span>
+                    </button>
+                  );
+                })}
+              </div>
+              {fields.length > 1 && fields[1]?.isChartField && (
+                <div className="mt-3 pt-3 border-t border-blue-500/20 text-xs">
+                  <span className="text-zinc-500">X-axis: </span>
+                  <span className="text-zinc-300">Date</span>
+                  <span className="text-zinc-500 ml-4">Y-axis: </span>
+                  <span className="text-emerald-400">{fields[1].label}</span>
                 </div>
-              ))}
-              {fields.length === 0 && (
-                <p className="text-sm text-zinc-500 text-center py-4">
-                  No fields configured. Add fields manually or select from the
-                  JSON explorer.
-                </p>
+              )}
+            </div>
+          )}
+
+          {/* Available Fields - Show after API test */}
+          {apiSuccess && (
+            <div>
+              <label className="block text-sm font-medium text-zinc-300 mb-2">
+                Available Fields
+              </label>
+              <input
+                type="text"
+                value={fieldSearch}
+                onChange={(e) => setFieldSearch(e.target.value)}
+                placeholder="Search fields..."
+                className="w-full px-3 py-2 mb-2 rounded-lg bg-zinc-800 border border-zinc-700 text-zinc-100 placeholder-zinc-500 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+              />
+              <div className="max-h-40 overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-800/50">
+                {filteredFields.length > 0 ? (
+                  filteredFields.slice(0, 30).map((field) => (
+                    <div
+                      key={field.path}
+                      className="flex items-center justify-between px-3 py-2 border-b border-zinc-700/50 last:border-b-0 hover:bg-zinc-800 transition-colors"
+                    >
+                      <div className="flex-1 min-w-0">
+                        <div className="text-sm text-zinc-200 font-mono truncate">
+                          {field.path}
+                          {field.isTimeSeries && (
+                            <span className="ml-2 text-xs px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-400">
+                              Time-Series
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-xs text-zinc-500 truncate">
+                          {field.type} | {field.value}
+                        </div>
+                      </div>
+                      {field.isTimeSeries ? (
+                        <button
+                          type="button"
+                          onClick={() => setDataPath(field.path)}
+                          className={`ml-2 px-2 py-1 rounded-lg text-xs font-medium transition-colors ${
+                            dataPath === field.path
+                              ? "bg-emerald-500 text-zinc-900"
+                              : "bg-zinc-700 text-zinc-300 hover:bg-zinc-600"
+                          }`}
+                        >
+                          {dataPath === field.path ? "Selected" : "Use Path"}
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => handleAddField(field)}
+                          className="ml-2 p-1.5 rounded-lg text-zinc-400 hover:text-emerald-400 hover:bg-emerald-500/20 transition-colors"
+                        >
+                          <svg
+                            xmlns="http://www.w3.org/2000/svg"
+                            width="16"
+                            height="16"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                          >
+                            <path d="M12 5v14M5 12h14" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  ))
+                ) : (
+                  <div className="px-3 py-4 text-center text-sm text-zinc-500">
+                    {fieldSearch ? "No fields match" : "No fields available"}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Selected Fields */}
+          <div>
+            <label className="block text-sm font-medium text-zinc-300 mb-2">
+              Selected Fields ({fields.length})
+            </label>
+            <div className="space-y-2">
+              {fields.length > 0 ? (
+                fields.map((field) => (
+                  <div
+                    key={field.key}
+                    className="flex items-center gap-2 p-2 rounded-lg bg-zinc-800 border border-zinc-700"
+                  >
+                    <div className="flex-1 min-w-0">
+                      <div className="text-xs text-zinc-400 font-mono truncate">
+                        {field.key}
+                      </div>
+                      <input
+                        type="text"
+                        value={field.label}
+                        onChange={(e) =>
+                          updateField(field.key, { label: e.target.value })
+                        }
+                        className="w-full mt-1 px-2 py-1 rounded bg-zinc-700 border border-zinc-600 text-zinc-100 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+                        placeholder="Display label"
+                      />
+                    </div>
+                    <select
+                      value={field.format}
+                      onChange={(e) =>
+                        updateField(field.key, { format: e.target.value })
+                      }
+                      className="px-2 py-1 rounded bg-zinc-700 border border-zinc-600 text-zinc-100 text-sm focus:outline-none focus:ring-1 focus:ring-blue-500/50"
+                    >
+                      <option value="string">String</option>
+                      <option value="number">Number</option>
+                      <option value="currency">Currency</option>
+                      <option value="percent">Percent</option>
+                    </select>
+                    <button
+                      type="button"
+                      onClick={() => removeField(field.key)}
+                      className="p-1.5 rounded-lg text-zinc-400 hover:text-red-400 hover:bg-red-500/20 transition-colors"
+                    >
+                      <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        width="16"
+                        height="16"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                      >
+                        <path d="M18 6L6 18M6 6l12 12" />
+                      </svg>
+                    </button>
+                  </div>
+                ))
+              ) : (
+                <div className="px-3 py-4 text-center text-sm text-zinc-500 rounded-lg border border-dashed border-zinc-700">
+                  No fields selected. Test the API and click + to add fields.
+                </div>
               )}
             </div>
           </div>
