@@ -4,16 +4,93 @@ import { useState, useMemo, useEffect } from "react";
 import { createPortal } from "react-dom";
 
 /**
+ * Detect if an object is a time-series format (dates as keys with OHLCV data)
+ * This is common in financial APIs like Alpha Vantage
+ */
+function isTimeSeriesObject(obj) {
+  if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
+
+  const keys = Object.keys(obj);
+  if (keys.length === 0) return false;
+
+  // Check if keys look like dates and values are objects with price data
+  const firstKey = keys[0];
+  const firstValue = obj[firstKey];
+
+  // Check if key looks like a date (YYYY-MM-DD or similar patterns)
+  const looksLikeDate =
+    /^\d{4}-\d{2}-\d{2}/.test(firstKey) || // YYYY-MM-DD
+    /^\d{4}\/\d{2}\/\d{2}/.test(firstKey) || // YYYY/MM/DD
+    !isNaN(Date.parse(firstKey)); // Any parseable date
+
+  // Check if value has price-related fields
+  const hasOHLCVFields =
+    firstValue &&
+    typeof firstValue === "object" &&
+    !Array.isArray(firstValue) &&
+    (("1. open" in firstValue && "4. close" in firstValue) || // Alpha Vantage format
+      ("open" in firstValue && "close" in firstValue)); // Standard format
+
+  return looksLikeDate && hasOHLCVFields;
+}
+
+/**
+ * Extract chart-specific fields from time-series data
+ * Returns normalized field names (open, high, low, close, volume)
+ */
+function extractTimeSeriesFields(obj) {
+  const keys = Object.keys(obj);
+  if (keys.length === 0) return [];
+
+  const firstValue = obj[keys[0]];
+  if (!firstValue || typeof firstValue !== "object") return [];
+
+  const innerKeys = Object.keys(firstValue);
+  const fields = [];
+
+  // Map Alpha Vantage format to clean names
+  const alphaVantageMap = {
+    "1. open": "open",
+    "2. high": "high",
+    "3. low": "low",
+    "4. close": "close",
+    "5. volume": "volume",
+    "5. adjusted close": "adjusted_close",
+    "6. volume": "volume",
+  };
+
+  for (const key of innerKeys) {
+    const cleanName = alphaVantageMap[key] || key;
+    const sampleValue = firstValue[key];
+
+    fields.push({
+      path: cleanName,
+      originalKey: key,
+      type: typeof sampleValue === "number" ? "number" : "string",
+      value: String(sampleValue).slice(0, 20),
+      isChartField: true,
+    });
+  }
+
+  return fields;
+}
+
+/**
  * Recursively extracts all field paths from a JSON object
  * Returns an array of { path, type, value } objects
  */
-function extractFieldPaths(obj, parentPath = "", results = []) {
+function extractFieldPaths(
+  obj,
+  parentPath = "",
+  results = [],
+  widgetType = null
+) {
   if (obj === null || obj === undefined) return results;
 
   if (Array.isArray(obj)) {
     // For arrays, sample the first item to get structure
     if (obj.length > 0 && typeof obj[0] === "object") {
-      extractFieldPaths(obj[0], parentPath, results);
+      extractFieldPaths(obj[0], parentPath, results, widgetType);
     }
     // Also mark the array itself as a path
     if (parentPath) {
@@ -40,16 +117,27 @@ function extractFieldPaths(obj, parentPath = "", results = []) {
         });
         // Recurse into array items
         if (value.length > 0) {
-          extractFieldPaths(value[0], currentPath, results);
+          extractFieldPaths(value[0], currentPath, results, widgetType);
         }
       } else if (typeof value === "object") {
+        // Check if this is a time-series object (for charts)
+        const isTimeSeries = isTimeSeriesObject(value);
+
         results.push({
           path: currentPath,
           type: "object",
-          value: "{...}",
+          value: isTimeSeries
+            ? `TimeSeries[${Object.keys(value).length}]`
+            : "{...}",
           isObject: true,
+          isTimeSeries: isTimeSeries,
         });
-        extractFieldPaths(value, currentPath, results);
+
+        // Only recurse into non-time-series objects
+        // Time-series will be handled specially in the UI
+        if (!isTimeSeries) {
+          extractFieldPaths(value, currentPath, results, widgetType);
+        }
       } else {
         results.push({
           path: currentPath,
@@ -128,8 +216,37 @@ export default function AddWidgetModal({ isOpen, onClose, onAdd }) {
   // Extract available fields from API response
   const availableFields = useMemo(() => {
     if (!apiResponse) return [];
-    return extractFieldPaths(apiResponse);
-  }, [apiResponse]);
+    return extractFieldPaths(apiResponse, "", [], formData.type);
+  }, [apiResponse, formData.type]);
+
+  // For charts: detect time-series data at the selected dataPath and extract OHLCV fields
+  const chartFields = useMemo(() => {
+    if (formData.type !== "chart" || !apiResponse || !formData.dataPath)
+      return [];
+
+    // Get the data at the selected path
+    const pathParts = formData.dataPath.split(".");
+    let data = apiResponse;
+    for (const part of pathParts) {
+      if (data && typeof data === "object") {
+        data = data[part];
+      } else {
+        return [];
+      }
+    }
+
+    // Check if it's time-series data
+    if (isTimeSeriesObject(data)) {
+      return extractTimeSeriesFields(data);
+    }
+
+    return [];
+  }, [formData.type, formData.dataPath, apiResponse]);
+
+  // Check if selected dataPath contains time-series data
+  const isTimeSeriesSelected = useMemo(() => {
+    return chartFields.length > 0;
+  }, [chartFields]);
 
   // Filter available fields based on search and filters
   const filteredFields = useMemo(() => {
@@ -147,11 +264,12 @@ export default function AddWidgetModal({ isOpen, onClose, onAdd }) {
 
     // Show arrays only filter
     if (showArraysOnly) {
-      fields = fields.filter((f) => f.isArray);
+      fields = fields.filter((f) => f.isArray || f.isTimeSeries);
     }
 
-    // Filter out objects (they're just containers)
-    fields = fields.filter((f) => !f.isObject);
+    // Filter out regular objects (they're just containers)
+    // But keep time-series objects (they're selectable as data paths for charts)
+    fields = fields.filter((f) => !f.isObject || f.isTimeSeries);
 
     return fields;
   }, [availableFields, selectedFields, fieldSearch, showArraysOnly]);
@@ -639,10 +757,121 @@ export default function AddWidgetModal({ isOpen, onClose, onAdd }) {
                   </span>
                 </label>
 
+                {/* Chart Time-Series Fields - Special UI for OHLCV data */}
+                {formData.type === "chart" && isTimeSeriesSelected && (
+                  <div className="mb-4 p-4 rounded-xl bg-blue-500/10 border border-blue-500/30">
+                    <div className="flex items-center gap-2 mb-3">
+                      <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        width="18"
+                        height="18"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        className="text-blue-400"
+                      >
+                        <path d="M3 3v18h18" />
+                        <path d="m19 9-5 5-4-4-3 3" />
+                      </svg>
+                      <span className="text-sm font-medium text-blue-400">
+                        Time-Series Data Detected
+                      </span>
+                    </div>
+                    <p className="text-xs text-zinc-400 mb-3">
+                      Select which value to plot on the chart (Y-axis). The
+                      dates will automatically be used for the X-axis.
+                    </p>
+                    <div className="flex flex-wrap gap-2">
+                      {chartFields.map((field) => {
+                        // Check if this is the selected Y-axis field (second field after time)
+                        const isSelected =
+                          selectedFields.length > 1 &&
+                          selectedFields[1]?.key === field.path;
+                        return (
+                          <button
+                            key={field.path}
+                            type="button"
+                            onClick={() => {
+                              // Set up fields for time-series chart:
+                              // First field = time (X-axis)
+                              // Second field = selected value (Y-axis)
+                              setSelectedFields([
+                                {
+                                  key: "time",
+                                  label: "Date",
+                                  format: "string",
+                                  isChartField: true,
+                                },
+                                {
+                                  key: field.path,
+                                  originalKey: field.originalKey,
+                                  label:
+                                    field.path.charAt(0).toUpperCase() +
+                                    field.path.slice(1),
+                                  format: "number",
+                                  isChartField: true,
+                                },
+                              ]);
+                            }}
+                            className={`
+                              px-3 py-2 rounded-lg text-sm font-medium transition-all
+                              ${
+                                isSelected
+                                  ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/50"
+                                  : "bg-zinc-800 text-zinc-300 border border-zinc-700 hover:border-zinc-500"
+                              }
+                            `}
+                          >
+                            <span className="capitalize">{field.path}</span>
+                            <span className="text-xs text-zinc-500 ml-1.5">
+                              ({field.type})
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                    {selectedFields.length > 1 &&
+                      selectedFields[1]?.isChartField && (
+                        <div className="mt-3 pt-3 border-t border-blue-500/20">
+                          <div className="flex items-center gap-4 text-xs">
+                            <span className="text-zinc-500">
+                              X-axis:{" "}
+                              <span className="text-zinc-300">Date (time)</span>
+                            </span>
+                            <span className="text-zinc-500">
+                              Y-axis:{" "}
+                              <span className="text-emerald-400">
+                                {selectedFields[1].label}
+                              </span>
+                            </span>
+                          </div>
+                        </div>
+                      )}
+                  </div>
+                )}
+
+                {/* Chart hint for time-series */}
+                {formData.type === "chart" &&
+                  !isTimeSeriesSelected &&
+                  formData.dataPath && (
+                    <div className="mb-4 p-3 rounded-lg bg-amber-500/10 border border-amber-500/30">
+                      <p className="text-xs text-amber-400">
+                        💡 Tip: For time-series charts, select a data path that
+                        contains date-keyed objects (e.g., "Time Series
+                        (Daily)"). The dates should be keys with price values
+                        inside.
+                      </p>
+                    </div>
+                  )}
+
                 {/* Available Fields */}
                 <div className="mb-4">
                   <label className="block text-xs font-medium text-zinc-400 mb-2">
-                    Available Fields
+                    Available Fields{" "}
+                    {formData.type === "chart" &&
+                      isTimeSeriesSelected &&
+                      "(or select from time-series above)"}
                   </label>
                   <div className="max-h-48 overflow-y-auto rounded-lg border border-zinc-700 bg-zinc-800/50">
                     {filteredFields.length > 0 ? (
@@ -654,28 +883,54 @@ export default function AddWidgetModal({ isOpen, onClose, onAdd }) {
                           <div className="flex-1 min-w-0">
                             <div className="text-sm text-zinc-200 font-mono truncate">
                               {field.path}
+                              {field.isTimeSeries && (
+                                <span className="ml-2 text-xs px-1.5 py-0.5 rounded bg-blue-500/20 text-blue-400">
+                                  Time-Series
+                                </span>
+                              )}
                             </div>
                             <div className="text-xs text-zinc-500 truncate">
                               {field.type} | {field.value}
                             </div>
                           </div>
-                          <button
-                            type="button"
-                            onClick={() => handleAddField(field)}
-                            className="ml-2 p-1.5 rounded-lg text-zinc-400 hover:text-emerald-400 hover:bg-emerald-500/20 transition-colors shrink-0"
-                          >
-                            <svg
-                              xmlns="http://www.w3.org/2000/svg"
-                              width="16"
-                              height="16"
-                              viewBox="0 0 24 24"
-                              fill="none"
-                              stroke="currentColor"
-                              strokeWidth="2"
+                          {field.isTimeSeries ? (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setFormData((prev) => ({
+                                  ...prev,
+                                  dataPath: field.path,
+                                }))
+                              }
+                              className={`ml-2 px-2 py-1 rounded-lg text-xs font-medium transition-colors shrink-0 ${
+                                formData.dataPath === field.path
+                                  ? "bg-emerald-500 text-zinc-900"
+                                  : "bg-zinc-700 text-zinc-300 hover:bg-zinc-600"
+                              }`}
                             >
-                              <path d="M12 5v14M5 12h14" />
-                            </svg>
-                          </button>
+                              {formData.dataPath === field.path
+                                ? "Selected"
+                                : "Use as Data Path"}
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => handleAddField(field)}
+                              className="ml-2 p-1.5 rounded-lg text-zinc-400 hover:text-emerald-400 hover:bg-emerald-500/20 transition-colors shrink-0"
+                            >
+                              <svg
+                                xmlns="http://www.w3.org/2000/svg"
+                                width="16"
+                                height="16"
+                                viewBox="0 0 24 24"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="2"
+                              >
+                                <path d="M12 5v14M5 12h14" />
+                              </svg>
+                            </button>
+                          )}
                         </div>
                       ))
                     ) : (
