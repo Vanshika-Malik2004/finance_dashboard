@@ -2,6 +2,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { getByPath } from "@/lib/jsonPath";
+import { normalizeData } from "../utils/normalizeData"; // adjust path
 
 /**
  * Custom hook for fetching widget data with React Query
@@ -10,14 +11,12 @@ import { getByPath } from "@/lib/jsonPath";
  * @param {Object} widget - Widget configuration object
  * @returns {Object} React Query result with additional processed data
  */
+
 export function useWidgetData(widget) {
-  const { id, apiUrl, dataPath, fields, refreshIntervalSec = 0 } = widget;
+  const { id, apiUrl, dataPath, fields, refreshIntervalSec = 0, type } = widget;
 
   const queryResult = useQuery({
-    // Unique query key includes all factors that affect the data
     queryKey: ["widget-data", id, apiUrl, dataPath, JSON.stringify(fields)],
-
-    // Fetch function
     queryFn: async () => {
       if (!apiUrl) {
         throw new Error("No API URL configured");
@@ -33,66 +32,29 @@ export function useWidgetData(widget) {
       }
 
       const json = await response.json();
-
-      // Extract data using dataPath
       const extractedData = getByPath(json, dataPath);
 
-      // Determine if data is a list or single object
-      let list = [];
-      let single = null;
-
-      if (Array.isArray(extractedData)) {
-        list = extractedData;
-        single = extractedData[0] || null;
-      } else if (extractedData && typeof extractedData === "object") {
-        single = extractedData;
-        list = [extractedData];
-      } else if (extractedData !== undefined) {
-        single = { value: extractedData };
-        list = [single];
-      }
-
-      return {
-        raw: json, // Original JSON response
-        extracted: extractedData, // Data at dataPath
-        list, // Array of items for tables/charts
-        single, // Single item for cards
-        timestamp: Date.now(),
-      };
+      // 🔥 Unified normalizer here:
+      return normalizeData({ ...widget, type }, extractedData, json);
     },
-
-    // Only fetch if we have an API URL
     enabled: Boolean(apiUrl),
-
-    // Auto-refresh interval (convert seconds to milliseconds)
     refetchInterval: refreshIntervalSec > 0 ? refreshIntervalSec * 1000 : false,
-
-    // Keep previous data while refetching
     placeholderData: (previousData) => previousData,
-
-    // Stale time - consider data fresh for 10 seconds
     staleTime: 10 * 1000,
-
-    // Don't retry too many times on error
     retry: 2,
     retryDelay: (attemptIndex) => Math.min(1000 * 2 ** attemptIndex, 10000),
-
-    // Handle errors gracefully
     throwOnError: false,
   });
 
-  // Process the data with field mappings if available
   const processedData = queryResult.data
     ? processDataWithFields(queryResult.data, fields)
     : null;
 
   return {
     ...queryResult,
-    // Additional processed data
     list: processedData?.list || [],
     single: processedData?.single || null,
     raw: queryResult.data?.raw || null,
-    // Convenience flags
     hasData: Boolean(processedData?.list?.length || processedData?.single),
     isEmpty:
       queryResult.isSuccess &&
