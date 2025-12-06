@@ -3,6 +3,7 @@
 import { useState, useMemo } from "react";
 import { useWidgetData } from "@/hooks/useWidgetData";
 import { getByPath, formatValue } from "@/lib/jsonPath";
+import ErrorDisplay from "./ErrorDisplay";
 
 /**
  * TableWidget Component
@@ -69,7 +70,7 @@ export default function TableWidget({ widget }) {
 
   // Error state
   if (isError) {
-    return <ErrorState error={error} onRetry={refetch} />;
+    return <ErrorDisplay error={error} onRetry={refetch} />;
   }
 
   // Empty state
@@ -257,38 +258,6 @@ function LoadingState() {
           <div key={i} className="h-10 bg-zinc-800/30 rounded" />
         ))}
       </div>
-    </div>
-  );
-}
-
-// Error state
-function ErrorState({ error, onRetry }) {
-  return (
-    <div className="flex flex-col items-center justify-center py-8 text-center">
-      <div className="w-12 h-12 rounded-xl bg-red-500/20 flex items-center justify-center mb-3">
-        <svg
-          xmlns="http://www.w3.org/2000/svg"
-          width="24"
-          height="24"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          className="text-red-400"
-        >
-          <circle cx="12" cy="12" r="10" />
-          <path d="M12 8v4M12 16h.01" />
-        </svg>
-      </div>
-      <p className="text-sm text-zinc-400 mb-3">
-        {error?.message || "Failed to load data"}
-      </p>
-      <button
-        onClick={onRetry}
-        className="px-3 py-1.5 text-xs font-medium bg-zinc-800 text-zinc-300 rounded-lg hover:bg-zinc-700 transition-colors"
-      >
-        Retry
-      </button>
     </div>
   );
 }

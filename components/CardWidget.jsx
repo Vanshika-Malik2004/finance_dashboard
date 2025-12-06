@@ -3,6 +3,7 @@
 import { useMemo } from "react";
 import { useWidgetData } from "@/hooks/useWidgetData";
 import { getByPath, formatValue } from "@/lib/jsonPath";
+import ErrorDisplay from "./ErrorDisplay";
 
 /**
  * CardWidget Component
@@ -37,7 +38,7 @@ export default function CardWidget({ widget }) {
 
   // Error state
   if (isError) {
-    return <ErrorState error={error} onRetry={refetch} />;
+    return <ErrorDisplay error={error} onRetry={refetch} compact />;
   }
 
   // Empty state
@@ -126,38 +127,6 @@ function LoadingState() {
         <div className="h-16 bg-zinc-800/30 rounded-lg" />
         <div className="h-16 bg-zinc-800/30 rounded-lg" />
       </div>
-    </div>
-  );
-}
-
-// Error state
-function ErrorState({ error, onRetry }) {
-  return (
-    <div className="flex flex-col items-center justify-center py-6 text-center">
-      <div className="w-10 h-10 rounded-xl bg-red-500/20 flex items-center justify-center mb-2">
-        <svg
-          xmlns="http://www.w3.org/2000/svg"
-          width="20"
-          height="20"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          className="text-red-400"
-        >
-          <circle cx="12" cy="12" r="10" />
-          <path d="M12 8v4M12 16h.01" />
-        </svg>
-      </div>
-      <p className="text-xs text-zinc-400 mb-2">
-        {error?.message || "Failed to load"}
-      </p>
-      <button
-        onClick={onRetry}
-        className="px-2 py-1 text-xs font-medium bg-zinc-800 text-zinc-300 rounded hover:bg-zinc-700 transition-colors"
-      >
-        Retry
-      </button>
     </div>
   );
 }

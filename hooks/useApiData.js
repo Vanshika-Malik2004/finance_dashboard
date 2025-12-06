@@ -2,10 +2,29 @@
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
+import {
+  parseHttpError,
+  parseNetworkError,
+  detectApiResponseError,
+  ErrorType,
+} from "@/lib/errorUtils";
 
 // Global registry to track refresh intervals per URL
 // This enables smart interval selection across widgets
 const refreshIntervalRegistry = new Map();
+
+/**
+ * Custom error class with additional metadata
+ */
+class ApiError extends Error {
+  constructor(errorInfo) {
+    super(errorInfo.message);
+    this.name = "ApiError";
+    this.type = errorInfo.type;
+    this.detail = errorInfo.detail;
+    this.retryAfter = errorInfo.retryAfter;
+  }
+}
 
 /**
  * Register a refresh interval for a URL
@@ -109,21 +128,55 @@ export function useApiData(apiUrl, options = {}) {
 
     queryFn: async () => {
       if (!apiUrl) {
-        throw new Error("No API URL configured");
+        throw new ApiError({
+          type: ErrorType.INVALID_DATA,
+          message: "No API URL configured",
+          detail: "Please configure an API URL for this widget.",
+        });
       }
 
       console.log(`[API Cache] Fetching: ${apiUrl}`);
 
-      const response = await fetch(apiUrl);
-
-      if (!response.ok) {
-        const errorText = await response.text().catch(() => "Unknown error");
-        throw new Error(
-          `API Error (${response.status}): ${errorText.slice(0, 100)}`
-        );
+      let response;
+      try {
+        response = await fetch(apiUrl);
+      } catch (fetchError) {
+        // Network error (no response at all)
+        const errorInfo = parseNetworkError(fetchError);
+        throw new ApiError(errorInfo);
       }
 
-      const json = await response.json();
+      // Get response body
+      const responseText = await response.text().catch(() => "");
+
+      // Check for HTTP errors
+      if (!response.ok) {
+        const errorInfo = parseHttpError(
+          response.status,
+          response.statusText,
+          responseText
+        );
+        throw new ApiError(errorInfo);
+      }
+
+      // Parse JSON
+      let json;
+      try {
+        json = JSON.parse(responseText);
+      } catch (parseError) {
+        throw new ApiError({
+          type: ErrorType.INVALID_DATA,
+          message: "Invalid response",
+          detail: "The API returned data that couldn't be parsed as JSON.",
+        });
+      }
+
+      // Check for API-specific errors in response body
+      // (Some APIs like Alpha Vantage return 200 with error in body)
+      const bodyError = detectApiResponseError(json);
+      if (bodyError) {
+        throw new ApiError(bodyError);
+      }
 
       return {
         data: json,
@@ -142,8 +195,15 @@ export function useApiData(apiUrl, options = {}) {
     // Stale time: 30 seconds - prevents excessive refetching
     staleTime: 30 * 1000,
 
-    // Don't retry too aggressively
-    retry: 2,
+    // Smart retry logic - don't retry on certain errors
+    retry: (failureCount, error) => {
+      // Don't retry rate limits, auth errors, or not found
+      if (error?.type === ErrorType.RATE_LIMIT) return false;
+      if (error?.type === ErrorType.AUTH_ERROR) return false;
+      if (error?.type === ErrorType.NOT_FOUND) return false;
+      // Retry other errors up to 2 times
+      return failureCount < 2;
+    },
     retryDelay: (attemptIndex) => Math.min(1000 * 2 ** attemptIndex, 10000),
 
     throwOnError: false,

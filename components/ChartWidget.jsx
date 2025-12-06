@@ -14,6 +14,7 @@ import {
 } from "recharts";
 import { useWidgetData } from "@/hooks/useWidgetData";
 import { getByPath, formatValue } from "@/lib/jsonPath";
+import ErrorDisplay from "./ErrorDisplay";
 
 /**
  * ChartWidget Component
@@ -87,7 +88,11 @@ export default function ChartWidget({ widget }) {
 
   // Error state
   if (isError) {
-    return <ErrorState error={error} onRetry={refetch} />;
+    return (
+      <div className="h-[200px]">
+        <ErrorDisplay error={error} onRetry={refetch} />
+      </div>
+    );
   }
 
   // Empty state
@@ -241,38 +246,6 @@ function LoadingState() {
       <div className="w-full h-full p-4">
         <div className="h-full w-full bg-zinc-800/50 rounded" />
       </div>
-    </div>
-  );
-}
-
-// Error state
-function ErrorState({ error, onRetry }) {
-  return (
-    <div className="h-[200px] flex flex-col items-center justify-center">
-      <div className="w-12 h-12 rounded-xl bg-red-500/20 flex items-center justify-center mb-3">
-        <svg
-          xmlns="http://www.w3.org/2000/svg"
-          width="24"
-          height="24"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          strokeWidth="2"
-          className="text-red-400"
-        >
-          <circle cx="12" cy="12" r="10" />
-          <path d="M12 8v4M12 16h.01" />
-        </svg>
-      </div>
-      <p className="text-sm text-zinc-400 mb-3">
-        {error?.message || "Failed to load chart"}
-      </p>
-      <button
-        onClick={onRetry}
-        className="px-3 py-1.5 text-xs font-medium bg-zinc-800 text-zinc-300 rounded-lg hover:bg-zinc-700 transition-colors"
-      >
-        Retry
-      </button>
     </div>
   );
 }
